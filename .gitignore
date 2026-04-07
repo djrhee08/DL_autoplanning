@@ -1,0 +1,11 @@
+*.dat
+*.xlsx
+*.xls
+*.pyc
+*.npy
+*.db
+*.dcm
+preprocessing-dev/data/
+preprocessing-dev/npy_total/
+DeepLearing-dev/data/
+VMAT_autoplan_script/data/
