@@ -1,22 +1,40 @@
 import time
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+from MLC2Aperture import (vmat_gantry_angles,
+                          DifferentiableMLCAperture,
+                          DifferentiableJawAperture)
 
 
 # =====================================================================
-# 1. Geometric 3D Projection Grid Builder (unchanged)
+# 1. Geometric 3D Projection Grid Builder
 # =====================================================================
-def build_hfs_perspective_grids(num_cps=180,
+def build_hfs_perspective_grids(gantry_angles_deg,
                                 feat_vol_size=(96, 96, 96),
                                 raw_ct_size=(192, 192, 192), ct_spacing=(3.0, 3.0, 3.0),
                                 raw_bev_size=(160, 160), bev_spacing=(2.5, 2.5),
                                 sad=1000.0, is_parallel=False):
     """
-    Builds a perspective projection grid from BEV space to a 3D feature volume.
-    Grid shape: [num_cps, D, H, W, 2]  (normalized coords for F.grid_sample)
+    Builds a perspective projection grid from BEV space into a 3D feature volume.
+
+    Args:
+        gantry_angles_deg : 1-D array or tensor of gantry angles (degrees).
+                            Obtain via vmat_gantry_angles(average=False) for 180
+                            per-CP angles, or vmat_gantry_angles(average=True) for
+                            179 mid-segment angles (RayStation VMAT convention).
+
+    Returns:
+        grid : [N, D, H, W, 2]  – normalised coords for F.grid_sample,
+               where N = len(gantry_angles_deg).
     """
+    if not isinstance(gantry_angles_deg, torch.Tensor):
+        gantry_angles_deg = torch.tensor(gantry_angles_deg, dtype=torch.float32)
+
+    angles_rad = gantry_angles_deg * (math.pi / 180.0)
+    num_cps    = gantry_angles_deg.shape[0]
+
     D, H, W = feat_vol_size
 
     fov_z = raw_ct_size[0] * ct_spacing[0]    # 576 mm
@@ -25,21 +43,21 @@ def build_hfs_perspective_grids(num_cps=180,
     fov_v = raw_bev_size[0] * bev_spacing[0]  # 400 mm (SI)
     fov_u = raw_bev_size[1] * bev_spacing[1]  # 400 mm (LR)
 
-    angles_deg = (181.0 + 2.0 * torch.arange(num_cps)) % 360.0
-    angles_rad = angles_deg * (math.pi / 180.0)
-
     grid_z, grid_y, grid_x = torch.meshgrid(
-        torch.linspace(-1, 1, D), torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing='ij'
+        torch.linspace(-1, 1, D),
+        torch.linspace(-1, 1, H),
+        torch.linspace(-1, 1, W),
+        indexing='ij'
     )
 
-    phys_x = (grid_x * (fov_x / 2.0)).unsqueeze(0)
+    phys_x = (grid_x * (fov_x / 2.0)).unsqueeze(0)   # [1, D, H, W]
     phys_y = (grid_y * (fov_y / 2.0)).unsqueeze(0)
     phys_z = (grid_z * (fov_z / 2.0)).unsqueeze(0)
 
-    cos_t = torch.cos(angles_rad).view(-1, 1, 1, 1)
+    cos_t = torch.cos(angles_rad).view(-1, 1, 1, 1)   # [N, 1, 1, 1]
     sin_t = torch.sin(angles_rad).view(-1, 1, 1, 1)
 
-    rot_x = phys_x * cos_t + phys_y * sin_t
+    rot_x = phys_x * cos_t + phys_y * sin_t            # [N, D, H, W]
     rot_y = -phys_x * sin_t + phys_y * cos_t
     rot_z = phys_z.expand(num_cps, -1, -1, -1)
 
@@ -57,22 +75,23 @@ def build_hfs_perspective_grids(num_cps=180,
 
 
 # =====================================================================
-# 2. 2D BEV Feature Encoder (unchanged from DoseCalculator.py)
+# 2. 2D BEV Feature Encoder
 # =====================================================================
 class BEVEncoder2D(nn.Module):
     """Encodes each CP's 2-channel aperture (jaw + MLC) into a 32-channel feature map.
-    Input:  [B, 180, 2, 160, 160]
-    Output: [B, 180, 32, 40, 40]
+
+    Input:  [B, N_cp, 2, 160, 160]   (N_cp = 179 with averaging, 180 without)
+    Output: [B, N_cp, 32,  40,  40]
     """
     def __init__(self, in_channels=2):
         super().__init__()
-        self.block1 = nn.Sequential(           # 160 -> 80
+        self.block1 = nn.Sequential(           # 160 → 80
             nn.Conv2d(in_channels, 16, kernel_size=3, stride=2, padding=1),
             nn.InstanceNorm2d(16), nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1),
             nn.InstanceNorm2d(16), nn.LeakyReLU(0.2, inplace=True)
         )
-        self.block2 = nn.Sequential(           # 80 -> 40
+        self.block2 = nn.Sequential(           # 80 → 40
             nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
             nn.InstanceNorm2d(32), nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
@@ -88,115 +107,107 @@ class BEVEncoder2D(nn.Module):
 
 
 # =====================================================================
-# 3. Per-CP Projection Layer  (NEW: stacks instead of sums)
+# 3. Per-CP Projection Layer
 # =====================================================================
 class PerCPProjectionLayer(nn.Module):
-    """Projects each CP's BEV feature map into a 3D volume at bottleneck resolution
-    (24³) using the same perspective grid_sample trick as DoseCalculator.py.
+    """Projects each CP's BEV feature map into the 3D bottleneck volume (24³)
+    using a perspective grid built from vmat_gantry_angles.
 
-    Difference from DoseCalculator.py: results are *stacked*, not summed.
+    Results are *stacked* (not summed) for the downstream attention layer.
 
-    Input:  bev_features  [B, N, C, 140, 140]
-    Output: beam_stack    [B, N, C, 24, 24, 24]
+    Args:
+        average  : if True, builds the grid for 179 mid-segment gantry angles
+                   (vmat_gantry_angles(average=True)); otherwise for 180 CP angles.
+        vol_size : spatial resolution of the output volume.
+
+    Input:  bev_features  [B, N_cp, 32,  40,  40]
+    Output: beam_stack    [B, N_cp, 32,  24,  24, 24]
     """
-    def __init__(self, num_cps=180, vol_size=(24, 24, 24)):
+    def __init__(self, average=False, vol_size=(24, 24, 24)):
         super().__init__()
-        self.num_cps = num_cps
         self.vol_size = vol_size
 
+        angles_deg     = torch.tensor(vmat_gantry_angles(average=average), dtype=torch.float32)
+        self.num_cps   = int(angles_deg.shape[0])   # 179 or 180
+
         grid = build_hfs_perspective_grids(
-            num_cps=num_cps,
+            gantry_angles_deg=angles_deg,
             feat_vol_size=vol_size,
             raw_ct_size=(192, 192, 192), ct_spacing=(3.0, 3.0, 3.0),
-            raw_bev_size=(160, 160), bev_spacing=(2.5, 2.5)
+            raw_bev_size=(160, 160),     bev_spacing=(2.5, 2.5)
         )
-        self.register_buffer('sampling_grid', grid)  # [N, D, H, W, 2]
+        self.register_buffer('sampling_grid', grid)  # [N_cp, D, H, W, 2]
 
     def forward(self, bev_features):
         B, N, C, H_bev, W_bev = bev_features.shape
         D, H_vol, W_vol = self.vol_size
+        assert N == self.num_cps, \
+            f"PerCPProjectionLayer expects {self.num_cps} CPs, got {N}"
 
-        # Fold N into batch: [B, N, C, H, W] → [B*N, C, H, W]
         bev_flat = bev_features.reshape(B * N, C, H_bev, W_bev)
 
-        # Build batched grid: [N, D, H, W, 2] → [N, D*H, W, 2] → [B*N, D*H, W, 2]
-        # expand copies N across B (stride-0 view), reshape forces contiguous copy
-        grid = self.sampling_grid.view(N, D * H_vol, W_vol, 2)            # [N, D*H, W, 2]
-        grid = grid.unsqueeze(0).expand(B, -1, -1, -1, -1)               # [B, N, D*H, W, 2]
-        grid = grid.reshape(B * N, D * H_vol, W_vol, 2)                  # [B*N, D*H, W, 2]
+        grid = self.sampling_grid.view(N, D * H_vol, W_vol, 2)
+        grid = grid.unsqueeze(0).expand(B, -1, -1, -1, -1)
+        grid = grid.reshape(B * N, D * H_vol, W_vol, 2)
 
-        projected = F.grid_sample(                                         # [B*N, C, D*H, W]
+        projected = F.grid_sample(
             bev_flat, grid,
             mode='bilinear', padding_mode='zeros', align_corners=True
         )
 
-        return projected.view(B, N, C, D, H_vol, W_vol)                   # [B, N, C, 24, 24, 24]
+        return projected.view(B, N, C, D, H_vol, W_vol)     # [B, N_cp, C, 24, 24, 24]
 
 
 # =====================================================================
-# 4. Spatially-Resolved Beam Attention  (NEW)
+# 4. Spatially-Resolved Beam Attention
 # =====================================================================
 class SpatialBeamAttention(nn.Module):
     """Cross-attention between CT bottleneck voxels and the per-CP projected beam stack.
 
-    For each voxel in the 24³ bottleneck volume, compute a soft attention weight
-    over all 180 CPs, then produce a weighted sum of their projected features.
+    For each voxel in the 24³ bottleneck, computes a soft attention weight
+    over all N_cp CPs, then produces a weighted sum of their projected features.
 
-    This replaces the naive summation in DoseCalculator.py:
-      - Old: fused = Σ_i  projected_i                  (commutative, attribution lost)
-      - New: fused = Σ_i  attn(voxel, CP_i) * proj_i  (each voxel attends selectively)
-
-    The learned attention weight is interpretable: attn[b, voxel, i] indicates how
-    much CP_i (at its gantry angle) contributes to that 3D voxel's dose.
+    attn_weights[b, voxel_idx, cp_idx] is interpretable as the contribution
+    of CP cp_idx to that 3D voxel's dose.
 
     Args:
-        ct_channels  : channels of CT bottleneck features (128)
-        beam_channels: channels of per-CP projected features (32)
-        num_cps      : number of control points (180)
+        ct_channels   : channels of the CT bottleneck (128)
+        beam_channels : channels of the per-CP projected features (32)
+        num_cps       : number of control points (179 with averaging, 180 without)
     """
-    def __init__(self, ct_channels=128, beam_channels=32, num_cps=180):
+    def __init__(self, ct_channels=128, beam_channels=32, num_cps=179):
         super().__init__()
-        self.scale = beam_channels ** -0.5
-
-        # Project CT features into the same space as beam features for dot-product attention
+        self.scale      = beam_channels ** -0.5
         self.query_proj = nn.Conv3d(ct_channels, beam_channels, kernel_size=1)
-        self.norm = nn.LayerNorm(beam_channels)
+        self.norm       = nn.LayerNorm(beam_channels)
 
     def forward(self, ct_feat, beam_stack):
         """
         Args:
-            ct_feat   : [B, C_ct,   D, H, W]        CT bottleneck (24³)
-            beam_stack: [B, N, C_b, D, H, W]        per-CP projected volumes (24³)
+            ct_feat    : [B, C_ct,    D, H, W]
+            beam_stack : [B, N_cp, C_b, D, H, W]
         Returns:
-            fused     : [B, C_b, D, H, W]           attention-weighted beam feature
-            attn_w    : [B, D*H*W, N]               attention weights (interpretable)
+            fused      : [B, C_b, D, H, W]
+            attn_w     : [B, D*H*W, N_cp]
         """
         B, C_ct, D, H, W = ct_feat.shape
         B, N, C_b, _, _, _ = beam_stack.shape
-        V = D * H * W  # 13,824 voxels at 24³
+        V = D * H * W
 
-        # Query from CT: [B, C_b, D, H, W] → [B, V, C_b]
-        q = self.query_proj(ct_feat).view(B, C_b, V).permute(0, 2, 1)
+        q  = self.query_proj(ct_feat).view(B, C_b, V).permute(0, 2, 1)  # [B, V, C_b]
+        kv = beam_stack.view(B, N, C_b, V)                               # [B, N, C_b, V]
 
-        # Key & Value = beam_stack: [B, N, C_b, V]
-        kv = beam_stack.view(B, N, C_b, V)
-
-        # Attention logits: dot product query [B, V, C_b] with keys [B, N, C_b, V]
-        # → [B, V, N]  (each voxel scores each CP)
         attn_logits = torch.einsum('bvc,bncv->bvn', q, kv) * self.scale
-        attn_w = torch.softmax(attn_logits, dim=-1)  # [B, V, N]
+        attn_w      = torch.softmax(attn_logits, dim=-1)                 # [B, V, N]
 
-        # Weighted aggregation: [B, V, N] × [B, N, C_b, V] → [B, V, C_b]
         fused = torch.einsum('bvn,bncv->bvc', attn_w, kv)
-
-        # LayerNorm then reshape back to 3D
         fused = self.norm(fused).permute(0, 2, 1).view(B, C_b, D, H, W)
 
-        return fused, attn_w  # attn_w is kept for visualization/analysis
+        return fused, attn_w
 
 
 # =====================================================================
-# 5. Shared 3D Conv Block (unchanged)
+# 5. Shared 3D Conv Block
 # =====================================================================
 class Conv3DBlock(nn.Module):
     def __init__(self, in_c, out_c):
@@ -218,111 +229,131 @@ class Conv3DBlock(nn.Module):
 class VMATDosePredictorAttention(nn.Module):
     """3D dose predictor for VMAT with spatially-resolved beam attention.
 
-    Key difference from VMATDosePredictor (DoseCalculator.py):
-      - Beam features are projected to 24³ (bottleneck resolution) individually,
-        kept separate as [B, 180, 32, 24³], then fused into the CT bottleneck
-        via cross-attention — not summed blindly at 96³.
-      - Attention weights [B, 13824, 180] tell you which CP contributes to
-        each 3D voxel, enabling per-angle dose attribution.
+    Args:
+        average : if True (recommended), uses 179 mid-segment gantry angles
+                  (RayStation VMAT convention: dose computed from the average of
+                  adjacent CP apertures).  If False, uses 180 per-CP angles.
+                  Must match the average= flag passed to DifferentiableMLCAperture
+                  and DifferentiableJawAperture when building bev_apertures.
 
-    Data flow:
-        BEV apertures [B,180,2,160,160]
-            → BEVEncoder2D           → [B, 180, 32, 40, 40]
-            → PerCPProjectionLayer   → [B, 180, 32,  24,  24, 24]   ← stacked, not summed
-                                                         ↓
+    Data flow (average=True, N_cp=179):
+        BEV apertures [B, 179, 2, 160, 160]   MU [B, 179]
+            → BEVEncoder2D           → [B, 179, 32,  40,  40]
+            → PerCPProjectionLayer   → [B, 179, 32,  24,  24, 24]
+            × mu[:, :, None, None, None, None]   ← MU scales 3D volumes
+                                                      ↓
         CT [B,1,192³] → U-Net encoder → bottleneck [B,128,24³]
-                                                         ↓
-                              SpatialBeamAttention  →  fused [B, 32, 24³]
-                                                         ↓
-                         concat + fusion_conv       →  [B,128,24³]
-                                                         ↓
-                              U-Net decoder         →  dose [B,1,192³]
+                                                      ↓
+                          SpatialBeamAttention  →  fused [B, 32, 24³]
+                                                      ↓
+                     concat + fusion_conv       →  [B,128,24³]
+                                                      ↓
+                          U-Net decoder         →  dose [B,1,192³]
+
+    For autoplanning (frozen model):
+        CT is fixed.  MLC/jaw positions, jaw positions, and MU are all
+        differentiable plan parameters. Gradients flow:
+            loss → dose → decoder → fused → (beam_stack × MU) → MU
+                                                               → beam_stack → BEV apertures
+                                                                              → MLC/jaw positions
     """
-    def __init__(self):
+    def __init__(self, average=True):
         super().__init__()
+        num_cps = 179 if average else 180
 
         # --- Beam pathway ---
         self.bev_encoder = BEVEncoder2D(in_channels=2)
-        self.per_cp_proj = PerCPProjectionLayer(num_cps=180, vol_size=(24, 24, 24))
-        self.beam_attn   = SpatialBeamAttention(ct_channels=128, beam_channels=32, num_cps=180)
+        self.per_cp_proj = PerCPProjectionLayer(average=average, vol_size=(24, 24, 24))
+        self.beam_attn   = SpatialBeamAttention(ct_channels=128, beam_channels=32, num_cps=num_cps)
 
-        # Merge attended beam features into bottleneck channels
-        # Input: 128 (CT bottleneck) + 32 (attended beam) = 160
+        # Merge attended beam features into bottleneck channels (128 + 32 = 160)
         self.fusion_conv = Conv3DBlock(160, 128)
 
         # --- CT encoder (U-Net) ---
-        self.enc0      = Conv3DBlock(1, 16)                       # [B,  16, 192³]
-        self.down1     = nn.Conv3d(16, 32, kernel_size=2, stride=2)
-        self.enc1      = Conv3DBlock(32, 32)                      # [B,  32,  96³]
-        self.down2     = nn.Conv3d(32, 64, kernel_size=2, stride=2)
-        self.enc2      = Conv3DBlock(64, 64)                      # [B,  64,  48³]
-        self.down3     = nn.Conv3d(64, 128, kernel_size=2, stride=2)
-        self.bottleneck = Conv3DBlock(128, 128)                   # [B, 128,  24³]
+        self.enc0       = Conv3DBlock(1, 16)                       # [B,  16, 192³]
+        self.down1      = nn.Conv3d(16, 32, kernel_size=2, stride=2)
+        self.enc1       = Conv3DBlock(32, 32)                      # [B,  32,  96³]
+        self.down2      = nn.Conv3d(32, 64, kernel_size=2, stride=2)
+        self.enc2       = Conv3DBlock(64, 64)                      # [B,  64,  48³]
+        self.down3      = nn.Conv3d(64, 128, kernel_size=2, stride=2)
+        self.bottleneck = Conv3DBlock(128, 128)                    # [B, 128,  24³]
 
         # --- Decoder ---
         self.up2  = nn.ConvTranspose3d(128, 64, kernel_size=2, stride=2)
-        self.dec2 = Conv3DBlock(128, 64)   # 64 up + 64 skip2
+        self.dec2 = Conv3DBlock(128, 64)    # 64 up + 64 skip2
 
         self.up1  = nn.ConvTranspose3d(64, 32, kernel_size=2, stride=2)
-        self.dec1 = Conv3DBlock(64, 32)    # 32 up + 32 skip1
+        self.dec1 = Conv3DBlock(64, 32)     # 32 up + 32 skip1
 
         self.up0  = nn.ConvTranspose3d(32, 16, kernel_size=2, stride=2)
-        self.dec0 = Conv3DBlock(32, 16)    # 16 up + 16 skip0
+        self.dec0 = Conv3DBlock(32, 16)     # 16 up + 16 skip0
 
         self.final_conv = nn.Sequential(
             nn.Conv3d(16, 1, kernel_size=1),
-            nn.ReLU(inplace=True)  # dose must be non-negative
+            nn.ReLU(inplace=True)
         )
 
-    def forward(self, ct, bev_apertures):
+    def forward(self, ct, bev_apertures, mu):
         """
         Args:
-            ct           : [B, 1, 192, 192, 192]   patient CT (electron density)
-            bev_apertures: [B, 180, 2, 160, 160]   jaw & MLC aperture sequence
+            ct            : [B, 1, 192, 192, 192]
+            bev_apertures : [B, N_cp, 2, 160, 160]   normalised jaw & MLC apertures (0–1)
+                            N_cp = 179 with average=True, 180 with average=False
+            mu            : [B, N_cp]                 MU per segment (cGy or monitor units).
+                            With average=True: pass mu_array[:, :179] — the last (0-valued)
+                            element of the 180-slot array is dropped by the caller.
+                            Applied after 3D projection so the aperture encoder always
+                            sees normalised geometry; MU is a separate amplitude pathway.
+                            Fully differentiable — autoplanning optimises MLC/jaw/MU
+                            jointly by backpropagating through the frozen model.
         Returns:
-            dose         : [B, 1, 192, 192, 192]   predicted 3D dose
-            attn_weights : [B, 13824, 180]          per-voxel per-CP attention (24³ = 13824)
+            dose         : [B, 1, 192, 192, 192]
+            attn_weights : [B, D*H*W, N_cp]
         """
+        B, N_cp = mu.shape
+
         # --- 1. Beam pathway ---
-        bev_feat   = self.bev_encoder(bev_apertures)   # [B, 180, 32, 140, 140]
-        beam_stack = self.per_cp_proj(bev_feat)        # [B, 180, 32,  24,  24, 24]
+        bev_feat   = self.bev_encoder(bev_apertures)            # [B, N_cp, 32, 40, 40]
+        beam_stack = self.per_cp_proj(bev_feat)                 # [B, N_cp, 32, 24, 24, 24]
+        # Scale each CP's projected 3D volume by its segment MU.
+        # Separates geometry (aperture encoder) from magnitude (MU), giving the
+        # autoplanning optimiser independent, well-conditioned gradients for both.
+        beam_stack = beam_stack * mu.view(B, N_cp, 1, 1, 1, 1)  # [B, N_cp, 32, 24, 24, 24]
 
         # --- 2. CT encoder ---
-        skip0      = self.enc0(ct)                     # [B,  16, 192, 192, 192]
-        skip1      = self.enc1(self.down1(skip0))      # [B,  32,  96,  96,  96]
-        skip2      = self.enc2(self.down2(skip1))      # [B,  64,  48,  48,  48]
-        bottle     = self.bottleneck(self.down3(skip2))# [B, 128,  24,  24,  24]
+        skip0  = self.enc0(ct)                         # [B,  16, 192, 192, 192]
+        skip1  = self.enc1(self.down1(skip0))          # [B,  32,  96,  96,  96]
+        skip2  = self.enc2(self.down2(skip1))          # [B,  64,  48,  48,  48]
+        bottle = self.bottleneck(self.down3(skip2))    # [B, 128,  24,  24,  24]
 
         # --- 3. Attention fusion at bottleneck ---
         beam_fused, attn_weights = self.beam_attn(bottle, beam_stack)
-        # beam_fused: [B, 32, 24³]  attn_weights: [B, 13824, 180]
-
         fused = self.fusion_conv(
             torch.cat([bottle, beam_fused], dim=1)     # [B, 160, 24³] → [B, 128, 24³]
         )
 
         # --- 4. Decoder ---
-        up2   = self.up2(fused)                                  # [B,  64, 48³]
-        dec2  = self.dec2(torch.cat([up2, skip2], dim=1))        # [B,  64, 48³]
+        up2  = self.up2(fused)
+        dec2 = self.dec2(torch.cat([up2, skip2], dim=1))
 
-        up1   = self.up1(dec2)                                   # [B,  32, 96³]
-        dec1  = self.dec1(torch.cat([up1, skip1], dim=1))        # [B,  32, 96³]
+        up1  = self.up1(dec2)
+        dec1 = self.dec1(torch.cat([up1, skip1], dim=1))
 
-        up0   = self.up0(dec1)                                   # [B,  16, 192³]
-        dec0  = self.dec0(torch.cat([up0, skip0], dim=1))        # [B,  16, 192³]
+        up0  = self.up0(dec1)
+        dec0 = self.dec0(torch.cat([up0, skip0], dim=1))
 
-        dose  = self.final_conv(dec0)                            # [B,   1, 192³]
+        dose = self.final_conv(dec0)
         return dose, attn_weights
 
 
 # =====================================================================
-# 7. Physics-Informed Loss (unchanged from DoseCalculator.py)
+# 7. Physics-Informed Loss
 # =====================================================================
 class PhysicsInformedDoseLoss(nn.Module):
     def __init__(self, alpha=1.0, beta=1.0):
         super().__init__()
-        self.alpha  = alpha
-        self.beta   = beta
+        self.alpha   = alpha
+        self.beta    = beta
         self.l1_loss = nn.L1Loss()
 
     def forward(self, pred_dose, true_dose):
@@ -354,134 +385,91 @@ def time_plan_optimization_epoch(
     n_epochs: int = 100,
     lr: float = 1e-3,
 ) -> dict:
-    """Benchmark one inverse-planning epoch: the dose engine is frozen and
-    MLC leaf positions, jaw BEV apertures, and MU weights are the
-    differentiable plan parameters being optimised via gradient descent.
+    """Benchmark one inverse-planning epoch with the dose engine frozen.
 
-    The frozen model acts as a differentiable dose engine — gradients flow
-    through it back to the plan parameters, but its weights are not updated.
-
-    Args:
-        model       : Trained VMATDosePredictorAttention. Frozen in-place
-                      for the duration of this call; call
-                      ``model.train()`` and re-enable grad afterwards if needed.
-        ct          : [B, 1, 192, 192, 192]  patient CT on the target device.
-        target_dose : [B, 1, 192, 192, 192]  clinical goal dose.
-        n_warmup    : Warmup epochs (GPU cache warm-up, not timed).
-        n_epochs    : Timed epochs.
-        lr          : Adam learning rate for plan parameters.
-
-    Returns:
-        dict with keys:
-            ``times_s``    – list[float]  per-epoch wall-clock time in seconds
-            ``mean_s``     – float        mean epoch time
-            ``std_s``      – float        std of epoch times
-            ``final_loss`` – float        PhysicsInformedDoseLoss after last epoch
+    Plan parameters (MLC leaf positions, jaw positions, MU weights) are
+    differentiable; gradients flow through the frozen dose engine back to
+    them.  Apertures are computed via DifferentiableMLCAperture /
+    DifferentiableJawAperture with average=True (RayStation convention).
     """
-    device = next(model.parameters()).device
+    device   = next(model.parameters()).device
     use_cuda = (device.type == 'cuda')
-    B = ct.shape[0]
+    B        = ct.shape[0]
 
-    # --- Freeze the dose engine ------------------------------------------
     for p in model.parameters():
         p.requires_grad_(False)
     model.eval()
 
-    # --- Try to use DifferentiableMLCAperture for leaf → aperture image ---
-    try:
-        from MLC2Aperture import DifferentiableMLCAperture
-        mlc_to_aperture = DifferentiableMLCAperture().to(device)
-        _use_mlc_module = True
-    except ImportError:
-        mlc_to_aperture = None
-        _use_mlc_module = False
+    mlc_to_aperture = DifferentiableMLCAperture().to(device)
+    jaw_to_aperture = DifferentiableJawAperture().to(device)
 
-    # --- Initialise learnable plan parameters ----------------------------
-    # MLC leaf positions (mm): X1 (negative/left bank) and X2 (positive/right bank)
+    # Raw plan parameters: always 180 CPs (averaging inside aperture layers → 179 segments)
     mlc_init = torch.zeros(B, 180, 60, 2, device=device)
-    mlc_init[..., 0] = -100.0   # X1 leaves: open 100 mm left of centreline
-    mlc_init[..., 1] =  100.0   # X2 leaves: open 100 mm right of centreline
+    mlc_init[..., 0] = -100.0   # X1 leaves: open 100 mm left
+    mlc_init[..., 1] =  100.0   # X2 leaves: open 100 mm right
     mlc_positions = nn.Parameter(mlc_init)
 
-    # Jaw BEV aperture: one channel per CP, initialised nearly fully open
-    jaw_bev = nn.Parameter(torch.ones(B, 180, 1, 160, 160, device=device) * 2.0)
-    # (sigmoid(2.0) ≈ 0.88 — nearly open; will be squashed to [0,1] during forward)
+    jaw_init = torch.zeros(B, 180, 2, 2, device=device)
+    jaw_init[:, :, 0, 0] = -100.0   # X1
+    jaw_init[:, :, 0, 1] =  100.0   # X2
+    jaw_init[:, :, 1, 0] = -100.0   # Y1
+    jaw_init[:, :, 1, 1] =  100.0   # Y2
+    jaw_positions = nn.Parameter(jaw_init)
 
-    # MU weights per CP: unconstrained logits, mapped to positive values via softplus
-    mu_logits = nn.Parameter(torch.zeros(B, 180, device=device))
+    # 179 segment MU values (one per averaged aperture slot)
+    mu_logits = nn.Parameter(torch.zeros(B, 179, device=device))
 
-    optimizer = torch.optim.Adam([mlc_positions, jaw_bev, mu_logits], lr=lr)
-    loss_fn = PhysicsInformedDoseLoss(alpha=1.0, beta=0.5)
+    optimizer = torch.optim.Adam([mlc_positions, jaw_positions, mu_logits], lr=lr)
+    loss_fn   = PhysicsInformedDoseLoss(alpha=1.0, beta=0.5)
 
     def _run_epoch():
         optimizer.zero_grad(set_to_none=True)
 
-        # MU per CP: [B, 180] → broadcast over aperture spatial dims
-        mu = F.softplus(mu_logits).view(B, 180, 1, 1, 1)  # [B, 180, 1, 1, 1]
+        # Apertures: average adjacent CP pairs → 179 segments
+        mlc_aperture = mlc_to_aperture(mlc_positions, average=True)  # [B, 179, 1, 160, 160]
+        jaw_aperture = jaw_to_aperture(jaw_positions, average=True)  # [B, 179, 1, 160, 160]
+        bev_apertures = torch.cat([jaw_aperture, mlc_aperture], dim=2)  # [B, 179, 2, 160, 160]
 
-        # MLC → 160×160 aperture image
-        if _use_mlc_module:
-            mlc_aperture = mlc_to_aperture(mlc_positions)         # [B, 180, 1, 160, 160]
-        else:
-            # Fallback: sigmoid ramp between X1 and X2 columns averaged over leaves
-            # (gradient-compatible proxy when MLC2Aperture is unavailable)
-            x1 = mlc_positions[..., 0:1]  # [B, 180, 60, 1]
-            x2 = mlc_positions[..., 1:2]  # [B, 180, 60, 1]
-            opening = torch.sigmoid(x2 - x1)  # [B, 180, 60, 1] ∈ (0,1)
-            mlc_aperture = opening.mean(dim=2, keepdim=True)       # [B, 180, 1, 1]
-            mlc_aperture = mlc_aperture.unsqueeze(-1).expand(B, 180, 1, 160, 160)
+        # MU per segment: positive via softplus
+        mu = F.softplus(mu_logits)  # [B, 179]
 
-        jaw_aperture = torch.sigmoid(jaw_bev)                      # [B, 180, 1, 160, 160]
-
-        # Stack channels and scale by MU: [B, 180, 2, 160, 160]
-        bev_apertures = torch.cat([jaw_aperture, mlc_aperture], dim=2) * mu
-
-        pred_dose, _ = model(ct, bev_apertures)
+        pred_dose, _ = model(ct, bev_apertures, mu)
         loss = loss_fn(pred_dose, target_dose)
         loss.backward()
         optimizer.step()
         return loss.item()
 
-    # --- Warmup (not timed) ----------------------------------------------
     for _ in range(n_warmup):
         _run_epoch()
         if use_cuda:
             torch.cuda.synchronize(device)
 
-    # --- Timed epochs ----------------------------------------------------
-    times = []
+    times      = []
     final_loss = None
     for _ in range(n_epochs):
         if use_cuda:
             torch.cuda.synchronize(device)
-        t0 = time.perf_counter()
+        t0         = time.perf_counter()
         final_loss = _run_epoch()
         if use_cuda:
             torch.cuda.synchronize(device)
         times.append(time.perf_counter() - t0)
 
-    mean_t = sum(times) / len(times)
+    mean_t   = sum(times) / len(times)
     variance = sum((t - mean_t) ** 2 for t in times) / max(len(times) - 1, 1)
-    std_t = variance ** 0.5
+    std_t    = variance ** 0.5
 
     print(f"[DoseEngine] Plan-optimisation epoch timing  ({device})")
     print(f"  epochs    : {n_epochs}  (+{n_warmup} warmup)")
     print(f"  mean/std  : {mean_t:.3f} ± {std_t:.3f} s")
     print(f"  total     : {sum(times):.2f} s")
     print(f"  final loss: {final_loss:.6f}")
-    if not _use_mlc_module:
-        print("  [WARN] MLC2Aperture not found — using sigmoid proxy for MLC aperture")
 
-    return {
-        'times_s':     times,
-        'mean_s':      mean_t,
-        'std_s':       std_t,
-        'final_loss':  final_loss,
-    }
+    return {'times_s': times, 'mean_s': mean_t, 'std_s': std_t, 'final_loss': final_loss}
 
 
 # =====================================================================
-# 9. Plan-optimisation timing benchmark (run this file directly)
+# 9. Smoke-test / benchmark (run this file directly)
 # =====================================================================
 if __name__ == "__main__":
     print("DoseCalculation_Attention")
@@ -491,7 +479,7 @@ if __name__ == "__main__":
 
     print(f"Device : {device}")
     print("Building model...")
-    model = VMATDosePredictorAttention().to(device)
+    model = VMATDosePredictorAttention(average=True).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters : {total_params:,}")
 

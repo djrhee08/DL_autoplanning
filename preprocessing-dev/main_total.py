@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import pathlib
 import numpy as np
@@ -9,7 +10,7 @@ from RPRD_import_total import DICOMRPRD_importer
 from RP_to_aperture import create_vmat_mlc_stack_for_beam
 
 current_dir = pathlib.Path(__file__).parent.resolve()
-root_path      = "Y:\\Research\\DL_autoplanning\\preprocessing-dev\\data\\total"
+root_path = os.path.join(current_dir, "../RS_Scripts/data")
 npy_output_dir = os.path.join(current_dir, "npy_total")
 
 os.makedirs(npy_output_dir, exist_ok=True)
@@ -91,8 +92,18 @@ for patient in os.listdir(root_path):
                 non_odd = [g for g in gantry_angles if g % 2 == 0]
                 if non_odd:
                     print(f"  Warning: {len(non_odd)} even gantry angle(s) in beam '{beam_name}': {non_odd[:5]}")
+                    print(f"  This is not acceptable. Please check the plan '{plan_name}' for patient '{patient}")
+                    sys.exit()
                 else:
                     print(f"  All {len(gantry_angles)} gantry angles are odd for beam '{beam_name}'.")
+
+                # Check that this arc does not span a full 360° (> 180 unique odd angles
+                # would overflow the 180-slot array and is a data error).
+                if len(gantry_angles) > 180:
+                    print(f"  Error: beam '{beam_name}' has {len(gantry_angles)} gantry-angle CPs "
+                          f"(> 180). Arc must cover ≤ 360° (≤ 180 unique 2°-bin slots). "
+                          f"Please check the plan '{plan_name}' for patient '{patient}'.")
+                    sys.exit(1)
 
                 # Each slot = one control point recorded directly (no averaging).
                 #   - MLC/jaw: positions at CP[i]
@@ -100,9 +111,11 @@ for patient in os.listdir(root_path):
                 #              last CP gets 0)
                 #   - angle:   CP gantry angle (odd: 181°, 183°, ..., 179°)
                 #              slot = ((gantry - 181) % 360) // 2
-                # 180 CPs → 180 slots
+                # slot 0 = 181°, slot 1 = 183°, ..., slot 179 = 179°  (CCW arc order)
+                # Arcs cover < 360°, so ≤ 180 slots are filled; the rest stay at zeros.
+                # Zeros represent "completely closed" aperture (X1=X2=0 for MLC, jaw shut).
                 # mlc: [180, num_leaf_pairs, 2] — axis2: 0=X1 (bankA), 1=X2 (bankB)
-                # jaw: [180, 2, 2]             — axis1: 0=X jaw, 1=Y jaw; axis2: [pos1, pos2]
+                # jaw: [180, 2, 2]              — axis1: 0=X jaw, 1=Y jaw; axis2: [pos1, pos2]
                 # mu:  [180, 1, 1]              — MU from this CP to next
                 mlc_array = np.zeros((180, num_leaf_pairs, 2), dtype=np.float32)
                 jaw_array = np.zeros((180, 2, 2),             dtype=np.float32)
@@ -140,7 +153,10 @@ for patient in os.listdir(root_path):
                     cp_gantry[i] = float(cp.GantryAngle) % 360 if hasattr(cp, 'GantryAngle') else None
 
                 # Second pass: one slot per CP — record positions directly, no averaging
-                canonical_start = 181  # odd-parity arcs: CPs at 181°, 183°, ..., 179°
+                # canonical_start = 181 ensures slot 0 = 181° always, regardless of arc
+                # direction.  For a CCW arc from 179°→181°, 179° lands at slot 179 and
+                # 181° (if present as the final CP) lands at slot 0.
+                canonical_start = 181
                 for i in range(len(cps)):
                     g = cp_gantry[i]
                     if g is None:

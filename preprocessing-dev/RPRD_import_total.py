@@ -381,8 +381,18 @@ class DICOMRPRD_importer():
         dose_info = {"BeamNumber":[], "DoseFile":[]}
         for rt_dose_file in rt_dose_list:
             rt_dose = dicom.dcmread(rt_dose_file)
+            summation_type = getattr(rt_dose, 'DoseSummationType', '').upper()
+            if summation_type != 'BEAM':
+                print(f"  Skipping dose file '{os.path.basename(rt_dose_file)}': "
+                      f"DoseSummationType='{summation_type}' (expected 'BEAM'). "
+                      f"Re-export per-beam doses from RayStation.")
+                continue
             if hasattr(rt_dose, 'ReferencedRTPlanSequence'):
                 for ref in rt_dose.ReferencedRTPlanSequence:
+                    if not hasattr(ref, 'ReferencedFractionGroupSequence'):
+                        print(f"  Skipping dose file '{os.path.basename(rt_dose_file)}': "
+                              f"missing ReferencedFractionGroupSequence.")
+                        continue
                     referenced_beam_number = ref.ReferencedFractionGroupSequence[0].ReferencedBeamSequence[0].ReferencedBeamNumber
                     dose_info["BeamNumber"].append(referenced_beam_number)
                     dose_info["DoseFile"].append(os.path.basename(rt_dose_file))

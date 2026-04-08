@@ -5,6 +5,9 @@
 *.npy
 *.db
 *.dcm
+*.pth
+
+.vscode/
 preprocessing-dev/data/
 preprocessing-dev/npy_total/
 DeepLearing-dev/data/

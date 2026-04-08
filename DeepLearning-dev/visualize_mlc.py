@@ -1,22 +1,64 @@
 """
-visualize_npy.py  –  Interactive viewer for jaw [180,160,160] and MLC [180,160,160] apertures.
+visualize_mlc.py  –  Interactive viewer for jaw [180,2,2] and MLC [180,60,2] position arrays.
 
-Shows a 1×3 panel (Jaw | MLC | Overlay) for each of the 180 control points.
-Use the slider or ← / → arrow keys to scrub through control points.
+Converts raw leaf/jaw positions to 160×160 aperture maps on the fly via
+DifferentiableJawAperture and DifferentiableMLCAperture (MLC2Aperture.py),
+then shows a 1×3 panel (Jaw | MLC | Overlay) for each of the 180 control points.
 
 Usage:
-    python DeepLearning-dev/visualize_npy.py
-    python DeepLearning-dev/visualize_npy.py --jaw path/to/jaw.npy --mlc path/to/mlc.npy
+    python DeepLearning-dev/visualize_mlc.py
+    python DeepLearning-dev/visualize_mlc.py --jaw path/to/jaw.npy --mlc path/to/mlc.npy
 """
 
 import argparse
 import glob
 import os
+import sys
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
 from matplotlib.patches import Patch
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from MLC2Aperture import DifferentiableMLCAperture, DifferentiableJawAperture, vmat_gantry_angles
+
+
+def positions_to_apertures(jaw_raw: np.ndarray, mlc_raw: np.ndarray, average: bool = False):
+    """
+    Convert raw position arrays to 2D aperture maps.
+
+    Args:
+        jaw_raw : [180, 2, 2]  – jaw positions (mm)
+        mlc_raw : [180, 60, 2] – MLC leaf positions (mm)
+        average : if True, average adjacent CP pairs (RayStation VMAT convention).
+                  Output has 179 slices instead of 180.
+
+    Returns:
+        jaw_2d   : [180, 160, 160] or [179, 160, 160]
+        mlc_2d   : [180, 160, 160] or [179, 160, 160]
+        angles   : [180] or [179]  gantry angles (degrees)
+    """
+    jaw_module = DifferentiableJawAperture(tau=0.1)
+    mlc_module = DifferentiableMLCAperture(tau=0.1)
+
+    if average:
+        # Reshape to [1, 180, *, *] for the N_cp averaging path
+        jaw_t = torch.from_numpy(jaw_raw).float().unsqueeze(0)   # [1, 180, 2, 2]
+        mlc_t = torch.from_numpy(mlc_raw).float().unsqueeze(0)   # [1, 180, 60, 2]
+        with torch.no_grad():
+            jaw_2d = jaw_module(jaw_t, average=True).squeeze(0).squeeze(1).numpy()  # [179, 160, 160]
+            mlc_2d = mlc_module(mlc_t, average=True).squeeze(0).squeeze(1).numpy()  # [179, 160, 160]
+    else:
+        jaw_t = torch.from_numpy(jaw_raw).float()   # [180, 2, 2]
+        mlc_t = torch.from_numpy(mlc_raw).float()   # [180, 60, 2]
+        with torch.no_grad():
+            jaw_2d = jaw_module(jaw_t).squeeze(1).numpy()   # [180, 160, 160]
+            mlc_2d = mlc_module(mlc_t).squeeze(1).numpy()   # [180, 160, 160]
+
+    angles = vmat_gantry_angles(average=average)
+    return jaw_2d, mlc_2d, angles
 
 
 def build_overlay(jaw_2d: np.ndarray, mlc_2d: np.ndarray) -> np.ndarray:
@@ -37,39 +79,52 @@ def build_overlay(jaw_2d: np.ndarray, mlc_2d: np.ndarray) -> np.ndarray:
 def main():
     parser = argparse.ArgumentParser()
     current_dir = Path(__file__).resolve().parent
+    data_dir = current_dir.parent / 'preprocessing-dev' / 'npy_total'
 
     def _find(pattern):
-        hits = glob.glob(os.path.join(current_dir, pattern))
-        return hits[0] if hits else None
+        for root in [str(data_dir), str(current_dir)]:
+            hits = glob.glob(os.path.join(root, '**', pattern), recursive=True)
+            if hits:
+                return hits[0]
+        return None
 
     parser.add_argument('--jaw', default=None)
     parser.add_argument('--mlc', default=None)
+    parser.add_argument('--average', default=True, action='store_true',
+                        help='Average adjacent CP positions (RayStation VMAT convention). '
+                             'Produces 179 aperture slices at midpoint gantry angles.')
     args = parser.parse_args()
 
-    jaw_path = args.jaw or _find('*_jaw_*.npy') or os.path.join(current_dir, 'jaw.npy')
-    mlc_path = args.mlc or _find('*_mlc_*.npy') or os.path.join(current_dir, 'mlc.npy')
+    jaw_path = args.jaw or _find('*_jaw.npy') or os.path.join(current_dir, 'jaw.npy')
+    mlc_path = args.mlc or _find('*_mlc.npy') or os.path.join(current_dir, 'mlc.npy')
 
     if not os.path.exists(jaw_path):
         raise FileNotFoundError(f"Jaw file not found: {jaw_path}")
     if not os.path.exists(mlc_path):
         raise FileNotFoundError(f"MLC file not found: {mlc_path}")
 
-    jaw_all = np.load(jaw_path)   # [180, 160, 160]
-    mlc_all = np.load(mlc_path)   # [180, 160, 160]
+    jaw_raw = np.load(jaw_path)   # [180, 2, 2]
+    mlc_raw = np.load(mlc_path)   # [180, 60, 2]
 
-    print(f"Loaded jaw: {jaw_all.shape}  from {os.path.basename(jaw_path)}")
-    print(f"Loaded MLC: {mlc_all.shape}  from {os.path.basename(mlc_path)}")
+    print(f"Loaded jaw: {jaw_raw.shape}  from {os.path.basename(jaw_path)}")
+    print(f"Loaded MLC: {mlc_raw.shape}  from {os.path.basename(mlc_path)}")
+    mode_str = "averaged (RayStation)" if args.average else "per-CP"
+    print(f"Converting positions to 2D apertures [{mode_str}]...")
+
+    jaw_all, mlc_all, angles = positions_to_apertures(jaw_raw, mlc_raw, average=args.average)
+
+    print(f"Jaw aperture: {jaw_all.shape}  range [{jaw_all.min():.3f}, {jaw_all.max():.3f}]")
+    print(f"MLC aperture: {mlc_all.shape}  range [{mlc_all.min():.3f}, {mlc_all.max():.3f}]")
 
     num_cps = jaw_all.shape[0]
-    angles  = (181.0 + 2.0 * np.arange(num_cps)) % 360.0
 
-    grid_size    = jaw_all.shape[1]
-    pixel_size   = 2.5
-    half         = (grid_size - 1) / 2.0 * pixel_size
-    extents      = [-half - pixel_size/2, half + pixel_size/2,
-                    -half - pixel_size/2, half + pixel_size/2]
+    grid_size  = 160
+    pixel_size = 2.5
+    half       = (grid_size - 1) / 2.0 * pixel_size
+    extents    = [-half - pixel_size / 2, half + pixel_size / 2,
+                  -half - pixel_size / 2, half + pixel_size / 2]
 
-    # Pre-build overlays
+    # Pre-build overlays for all CPs
     ovl_all = np.stack([build_overlay(jaw_all[i], mlc_all[i]) for i in range(num_cps)])
 
     # ── Figure ──

@@ -5,10 +5,10 @@ from matplotlib.widgets import Slider
 from pathlib import Path
 
 current_dir = Path(__file__).resolve().parent
-data_dir = os.path.join(current_dir, '../preprocessing-dev/npy_total/xxxxx')
+data_dir = os.path.join(current_dir, '../preprocessing-dev/npy_total/test')
 
-CT_file   = 'xxxxx_VMAT_1arcs_00_A_CT.npy'
-dose_file = 'xxxxx_VMAT_1arcs_00_A_dose.npy'
+CT_file   = 'test_plan0_A_CT.npy'
+dose_file = 'test_plan0_A_dose.npy'
 
 CT   = np.load(os.path.join(data_dir, CT_file))    # [192, 192, 192]
 dose = np.load(os.path.join(data_dir, dose_file))  # [192, 192, 192]
