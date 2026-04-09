@@ -75,9 +75,8 @@ def find_coordinate_limit(case, CTName):
     return minmax_list
 
 # define new iso position randomly within the coordinate limits of the target
-def get_newiso(case, CTName, beam_set):
+def get_newiso(case, CTName, current_iso):
     minmax_list = find_coordinate_limit(case, CTName)
-    current_iso = beam_set.Beams[0].Isocenter.Position
 
     x_min = max(current_iso['x'] - 3, minmax_list[0])
     x_max = min(current_iso['x'] + 3, minmax_list[1])
@@ -95,7 +94,8 @@ def get_newiso(case, CTName, beam_set):
 
 # reset isocenter position
 def reset_isocenter(case, beam_set, CTName, IsoName='zz_test_iso'):
-    x_iso, y_iso, z_iso = get_newiso(case, CTName, beam_set)
+    current_iso = beam_set.Beams[0].Isocenter.Position
+    x_iso, y_iso, z_iso = get_newiso(case, CTName, current_iso)
     
     # Apply new iso to the beam
     for beam in beam_set.Beams:
