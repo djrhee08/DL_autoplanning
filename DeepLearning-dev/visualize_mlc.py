@@ -90,7 +90,7 @@ def main():
 
     parser.add_argument('--jaw', default=None)
     parser.add_argument('--mlc', default=None)
-    parser.add_argument('--average', default=True, action='store_true',
+    parser.add_argument('--average', default=False, action='store_true',
                         help='Average adjacent CP positions (RayStation VMAT convention). '
                              'Produces 179 aperture slices at midpoint gantry angles.')
     args = parser.parse_args()
