@@ -1,7 +1,7 @@
 """
 visualize_mlc.py  –  Interactive viewer for jaw [180,2,2] and MLC [180,60,2] position arrays.
 
-Converts raw leaf/jaw positions to 160×160 aperture maps on the fly via
+Converts raw leaf/jaw positions to 560×560 aperture maps on the fly via
 DifferentiableJawAperture and DifferentiableMLCAperture (MLC2Aperture.py),
 then shows a 1×3 panel (Jaw | MLC | Overlay) for each of the 180 control points.
 
@@ -36,8 +36,8 @@ def positions_to_apertures(jaw_raw: np.ndarray, mlc_raw: np.ndarray, average: bo
                   Output has 179 slices instead of 180.
 
     Returns:
-        jaw_2d   : [180, 160, 160] or [179, 160, 160]
-        mlc_2d   : [180, 160, 160] or [179, 160, 160]
+        jaw_2d   : [180, 560, 560] or [179, 560, 560]
+        mlc_2d   : [180, 560, 560] or [179, 560, 560]
         angles   : [180] or [179]  gantry angles (degrees)
     """
     jaw_module = DifferentiableJawAperture(tau=0.1)
@@ -48,14 +48,14 @@ def positions_to_apertures(jaw_raw: np.ndarray, mlc_raw: np.ndarray, average: bo
         jaw_t = torch.from_numpy(jaw_raw).float().unsqueeze(0)   # [1, 180, 2, 2]
         mlc_t = torch.from_numpy(mlc_raw).float().unsqueeze(0)   # [1, 180, 60, 2]
         with torch.no_grad():
-            jaw_2d = jaw_module(jaw_t, average=True).squeeze(0).squeeze(1).numpy()  # [179, 160, 160]
-            mlc_2d = mlc_module(mlc_t, average=True).squeeze(0).squeeze(1).numpy()  # [179, 160, 160]
+            jaw_2d = jaw_module(jaw_t, average=True).squeeze(0).squeeze(1).numpy()  # [179, 560, 560]
+            mlc_2d = mlc_module(mlc_t, average=True).squeeze(0).squeeze(1).numpy()  # [179, 560, 560]
     else:
         jaw_t = torch.from_numpy(jaw_raw).float()   # [180, 2, 2]
         mlc_t = torch.from_numpy(mlc_raw).float()   # [180, 60, 2]
         with torch.no_grad():
-            jaw_2d = jaw_module(jaw_t).squeeze(1).numpy()   # [180, 160, 160]
-            mlc_2d = mlc_module(mlc_t).squeeze(1).numpy()   # [180, 160, 160]
+            jaw_2d = jaw_module(jaw_t).squeeze(1).numpy()   # [180, 560, 560]
+            mlc_2d = mlc_module(mlc_t).squeeze(1).numpy()   # [180, 560, 560]
 
     angles = vmat_gantry_angles(average=average)
     return jaw_2d, mlc_2d, angles
@@ -118,8 +118,8 @@ def main():
 
     num_cps = jaw_all.shape[0]
 
-    grid_size  = 160
-    pixel_size = 2.5
+    grid_size  = 560
+    pixel_size = 1.0
     half       = (grid_size - 1) / 2.0 * pixel_size
     extents    = [-half - pixel_size / 2, half + pixel_size / 2,
                   -half - pixel_size / 2, half + pixel_size / 2]

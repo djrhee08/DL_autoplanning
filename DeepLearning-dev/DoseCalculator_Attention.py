@@ -14,7 +14,7 @@ from MLC2Aperture import (vmat_gantry_angles,
 def build_hfs_perspective_grids(gantry_angles_deg,
                                 feat_vol_size=(96, 96, 96),
                                 raw_ct_size=(192, 192, 192), ct_spacing=(3.0, 3.0, 3.0),
-                                raw_bev_size=(160, 160), bev_spacing=(2.5, 2.5),
+                                raw_bev_size=(560, 560), bev_spacing=(1.0, 1.0),
                                 sad=1000.0, is_parallel=False):
     """
     Builds a perspective projection grid from BEV space into a 3D feature volume.
@@ -80,18 +80,28 @@ def build_hfs_perspective_grids(gantry_angles_deg,
 class BEVEncoder2D(nn.Module):
     """Encodes each CP's 2-channel aperture (jaw + MLC) into a 32-channel feature map.
 
-    Input:  [B, N_cp, 2, 160, 160]   (N_cp = 179 with averaging, 180 without)
-    Output: [B, N_cp, 32,  40,  40]
+    Three strided blocks reduce the 560×560 input by 8× to 70×70, preserving
+    the sub-mm leaf-edge fidelity while keeping the downstream 3D projection
+    tractable.
+
+    Input:  [B, N_cp, 2, 560, 560]   (N_cp = 179 with averaging, 180 without)
+    Output: [B, N_cp, 32,  70,  70]
     """
     def __init__(self, in_channels=2):
         super().__init__()
-        self.block1 = nn.Sequential(           # 160 → 80
-            nn.Conv2d(in_channels, 16, kernel_size=3, stride=2, padding=1),
+        self.block1 = nn.Sequential(           # 560 → 280
+            nn.Conv2d(in_channels, 8, kernel_size=3, stride=2, padding=1),
+            nn.InstanceNorm2d(8), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(8, 8, kernel_size=3, stride=1, padding=1),
+            nn.InstanceNorm2d(8), nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.block2 = nn.Sequential(           # 280 → 140
+            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),
             nn.InstanceNorm2d(16), nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1),
             nn.InstanceNorm2d(16), nn.LeakyReLU(0.2, inplace=True)
         )
-        self.block2 = nn.Sequential(           # 80 → 40
+        self.block3 = nn.Sequential(           # 140 → 70
             nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
             nn.InstanceNorm2d(32), nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
@@ -101,7 +111,7 @@ class BEVEncoder2D(nn.Module):
     def forward(self, x):
         B, N, C, H, W = x.shape
         x = x.view(B * N, C, H, W)
-        x = self.block2(self.block1(x))
+        x = self.block3(self.block2(self.block1(x)))
         _, C_out, H_out, W_out = x.shape
         return x.view(B, N, C_out, H_out, W_out)
 
@@ -120,7 +130,7 @@ class PerCPProjectionLayer(nn.Module):
                    (vmat_gantry_angles(average=True)); otherwise for 180 CP angles.
         vol_size : spatial resolution of the output volume.
 
-    Input:  bev_features  [B, N_cp, 32,  40,  40]
+    Input:  bev_features  [B, N_cp, 32,  70,  70]
     Output: beam_stack    [B, N_cp, 32,  24,  24, 24]
     """
     def __init__(self, average=False, vol_size=(24, 24, 24)):
@@ -134,7 +144,7 @@ class PerCPProjectionLayer(nn.Module):
             gantry_angles_deg=angles_deg,
             feat_vol_size=vol_size,
             raw_ct_size=(192, 192, 192), ct_spacing=(3.0, 3.0, 3.0),
-            raw_bev_size=(160, 160),     bev_spacing=(2.5, 2.5)
+            raw_bev_size=(560, 560),     bev_spacing=(1.0, 1.0)
         )
         self.register_buffer('sampling_grid', grid)  # [N_cp, D, H, W, 2]
 
@@ -237,8 +247,8 @@ class VMATDosePredictorAttention(nn.Module):
                   and DifferentiableJawAperture when building bev_apertures.
 
     Data flow (average=True, N_cp=179):
-        BEV apertures [B, 179, 2, 160, 160]   MU [B, 179]
-            → BEVEncoder2D           → [B, 179, 32,  40,  40]
+        BEV apertures [B, 179, 2, 560, 560]   MU [B, 179]
+            → BEVEncoder2D           → [B, 179, 32,  70,  70]
             → PerCPProjectionLayer   → [B, 179, 32,  24,  24, 24]
             × mu[:, :, None, None, None, None]   ← MU scales 3D volumes
                                                       ↓
@@ -297,7 +307,7 @@ class VMATDosePredictorAttention(nn.Module):
         """
         Args:
             ct            : [B, 1, 192, 192, 192]
-            bev_apertures : [B, N_cp, 2, 160, 160]   normalised jaw & MLC apertures (0–1)
+            bev_apertures : [B, N_cp, 2, 560, 560]   normalised jaw & MLC apertures (0–1)
                             N_cp = 179 with average=True, 180 with average=False
             mu            : [B, N_cp]                 MU per segment (cGy or monitor units).
                             With average=True: pass mu_array[:, :179] — the last (0-valued)
@@ -426,9 +436,9 @@ def time_plan_optimization_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         # Apertures: average adjacent CP pairs → 179 segments
-        mlc_aperture = mlc_to_aperture(mlc_positions, average=True)  # [B, 179, 1, 160, 160]
-        jaw_aperture = jaw_to_aperture(jaw_positions, average=True)  # [B, 179, 1, 160, 160]
-        bev_apertures = torch.cat([jaw_aperture, mlc_aperture], dim=2)  # [B, 179, 2, 160, 160]
+        mlc_aperture = mlc_to_aperture(mlc_positions, average=True)  # [B, 179, 1, 560, 560]
+        jaw_aperture = jaw_to_aperture(jaw_positions, average=True)  # [B, 179, 1, 560, 560]
+        bev_apertures = torch.cat([jaw_aperture, mlc_aperture], dim=2)  # [B, 179, 2, 560, 560]
 
         # MU per segment: positive via softplus
         mu = F.softplus(mu_logits)  # [B, 179]
