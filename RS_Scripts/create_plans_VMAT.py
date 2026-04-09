@@ -245,7 +245,7 @@ for idx, pID in enumerate(pID_list):
             
             # Get new isocenter coordinates
             rand_IsoName = random_string = ''.join(random.choices(characters, k=5))
-            iso_x, iso_y, iso_z = get_newiso(case, CTName)
+            iso_x, iso_y, iso_z = get_newiso(case, CTName, beam_set)
             print("new isocenter:", iso_x, iso_y, iso_z)
             
             print("Deleting existing beams... ")

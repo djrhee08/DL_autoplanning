@@ -75,17 +75,27 @@ def find_coordinate_limit(case, CTName):
     return minmax_list
 
 # define new iso position randomly within the coordinate limits of the target
-def get_newiso(case, CTName):
+def get_newiso(case, CTName, beam_set):
     minmax_list = find_coordinate_limit(case, CTName)
-    x_iso = round(random.uniform(minmax_list[0], minmax_list[1]),2)
-    y_iso = round(random.uniform(minmax_list[2], minmax_list[3]),2)
-    z_iso = round(random.uniform(minmax_list[4], minmax_list[5]),2)
-    
+    current_iso = beam_set.Beams[0].Isocenter.Position
+
+    x_min = max(current_iso['x'] - 3, minmax_list[0])
+    x_max = min(current_iso['x'] + 3, minmax_list[1])
+    x_iso = round(random.uniform(x_min, x_max), 2)
+
+    y_min = max(current_iso['y'] - 3, minmax_list[2])
+    y_max = min(current_iso['y'] + 3, minmax_list[3])
+    y_iso = round(random.uniform(y_min, y_max), 2)
+
+    z_min = max(current_iso['z'] - 3, minmax_list[4])
+    z_max = min(current_iso['z'] + 3, minmax_list[5])
+    z_iso = round(random.uniform(z_min, z_max), 2)
+
     return x_iso, y_iso, z_iso
 
 # reset isocenter position
 def reset_isocenter(case, beam_set, CTName, IsoName='zz_test_iso'):
-    x_iso, y_iso, z_iso = get_newiso(case, CTName)
+    x_iso, y_iso, z_iso = get_newiso(case, CTName, beam_set)
     
     # Apply new iso to the beam
     for beam in beam_set.Beams:
