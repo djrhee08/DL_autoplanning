@@ -29,6 +29,7 @@ Pipeline:
         → dose [B,1,192,192,192]
 """
 
+import time
 import math
 import torch
 import torch.nn as nn
@@ -548,7 +549,95 @@ class PhysicsInformedDoseLoss(nn.Module):
 
 
 # =====================================================================
-# 9. Smoke test
+# 9. Plan-Optimisation Epoch Timer (frozen dose engine)
+# =====================================================================
+def time_plan_optimization_epoch(
+    model: 'HighAccuracyVMATPredictor',
+    ct: torch.Tensor,
+    target_dose: torch.Tensor,
+    n_warmup: int = 3,
+    n_epochs: int = 100,
+    lr: float = 1e-3,
+) -> dict:
+    """Benchmark one inverse-planning epoch with the dose engine frozen.
+
+    Plan parameters (MLC leaf positions, jaw positions, MU weights) are
+    differentiable; gradients flow through the frozen dose engine back to
+    them.  The model handles MLC/Jaw → aperture conversion internally via
+    DifferentiableMLCAperture / DifferentiableJawAperture (average=True).
+    """
+    device   = next(model.parameters()).device
+    use_cuda = (device.type == 'cuda')
+    B        = ct.shape[0]
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+    model.eval()
+
+    # Raw plan parameters: always 180 CPs (averaging to 179 segments happens inside the model)
+    mlc_init = torch.zeros(B, 180, 60, 2, device=device)
+    mlc_init[..., 0] = -100.0   # X1 leaves: open 100 mm left
+    mlc_init[..., 1] =  100.0   # X2 leaves: open 100 mm right
+    mlc_positions = nn.Parameter(mlc_init)
+
+    jaw_init = torch.zeros(B, 180, 2, 2, device=device)
+    jaw_init[:, :, 0, 0] = -100.0   # X1
+    jaw_init[:, :, 0, 1] =  100.0   # X2
+    jaw_init[:, :, 1, 0] = -100.0   # Y1
+    jaw_init[:, :, 1, 1] =  100.0   # Y2
+    jaw_positions = nn.Parameter(jaw_init)
+
+    # 179 segment MU values (one per averaged aperture slot)
+    mu_logits = nn.Parameter(torch.zeros(B, 179, device=device))
+
+    optimizer = torch.optim.Adam([mlc_positions, jaw_positions, mu_logits], lr=lr)
+    loss_fn   = PhysicsInformedDoseLoss(alpha=1.0, beta=0.5)
+
+    def _run_epoch():
+        optimizer.zero_grad(set_to_none=True)
+
+        # MU per segment: positive via softplus
+        mu = F.softplus(mu_logits)  # [B, 179]
+
+        # Model internally builds apertures and projects to 3D
+        pred_dose = model(ct, mlc_positions, jaw_positions, mu)
+        loss = loss_fn(pred_dose, target_dose)
+        loss.backward()
+        optimizer.step()
+        return loss.item()
+
+    for _ in range(n_warmup):
+        _run_epoch()
+        if use_cuda:
+            torch.cuda.synchronize(device)
+
+    times      = []
+    final_loss = None
+    for _ in range(n_epochs):
+        if use_cuda:
+            torch.cuda.synchronize(device)
+        t0         = time.perf_counter()
+        final_loss = _run_epoch()
+        if use_cuda:
+            torch.cuda.synchronize(device)
+        times.append(time.perf_counter() - t0)
+        print("time:", time.perf_counter() - t0)
+
+    mean_t   = sum(times) / len(times)
+    variance = sum((t - mean_t) ** 2 for t in times) / max(len(times) - 1, 1)
+    std_t    = variance ** 0.5
+
+    print(f"[HighAccuracyVMATPredictor] Plan-optimisation epoch timing  ({device})")
+    print(f"  epochs    : {n_epochs}  (+{n_warmup} warmup)")
+    print(f"  mean/std  : {mean_t:.3f} ± {std_t:.3f} s")
+    print(f"  total     : {sum(times):.2f} s")
+    print(f"  final loss: {final_loss:.6f}")
+
+    return {'times_s': times, 'mean_s': mean_t, 'std_s': std_t, 'final_loss': final_loss}
+
+
+# =====================================================================
+# 10. Smoke test
 # =====================================================================
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -582,3 +671,18 @@ if __name__ == "__main__":
     print(f"Dose output shape: {dose.shape}")
     print(f"Dose range: [{dose.min():.4f}, {dose.max():.4f}]")
     print("Forward pass successful!")
+
+    print("\nGenerating dummy target dose for plan-optimisation benchmark...")
+    target_dose = torch.rand(B, 1, 192, 192, 192, device=device)
+
+    print("Starting plan-optimisation epoch benchmark...\n")
+    results = time_plan_optimization_epoch(
+        model       = model,
+        ct          = ct,
+        target_dose = target_dose,
+        n_warmup    = 2,
+        n_epochs    = 10,
+        lr          = 1e-3,
+    )
+
+    print("\nPer-epoch times (s):", [f"{t:.3f}" for t in results['times_s']])
