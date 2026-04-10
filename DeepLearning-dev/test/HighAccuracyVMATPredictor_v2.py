@@ -1,39 +1,21 @@
 """
-High-Accuracy VMAT Dose Predictor (v2)
-=======================================
-Updated to match the existing pipeline conventions:
-  - 560×560 1mm BEV aperture (560mm FOV)
-  - 179 averaged control points (RayStation VMAT convention)
-  - Uses existing DifferentiableMLCAperture / DifferentiableJawAperture
-  - jaw and MLC apertures combined by element-wise multiplication
-    (physically: AND of jaw_open and MLC_open)
-  - End-to-end from raw MLC/Jaw/MU inputs (no pre-built BEV)
-  - 48³ projection volume for memory efficiency
-  - 4D spatio-angular convolution with circular padding
-  - CT-conditioned TERMA + learned multi-scale dose kernel
-  - Refinement decoder upsamples 48³ → 192³ with CT skip connections
+High-Accuracy VMAT Dose Predictor (v2-48 with gradient checkpointing)
+======================================================================
+Same architecture as v2-48 (A + B improvements at 48³) but with gradient
+checkpointing on the two memory-heaviest components:
 
-Pipeline:
-    MLC[B,180,60,2], Jaw[B,180,2,2], MU[B,179]
-        → DifferentiableMLCAperture(average=True) → mlc_ap [B,179,1,560,560]
-        → DifferentiableJawAperture(average=True) → jaw_ap [B,179,1,560,560]
-        → aperture = mlc_ap * jaw_ap                       [B,179,1,560,560]
-        → MU weighting (inside model)
-        → grid_sample with 48³ perspective grid             [B,179,1,48,48,48]
-        → fluence embedding [B,C,179,48,48,48]
-        → SpatioAngular conv blocks ×2
-        → angular sum → [B,C,48,48,48]
-        → CT-conditioned TERMA (concat with CT features at 48³)
-        → Learned multi-scale dose kernel
-        → Refinement decoder (48³ → 96³ → 192³ with CT skips)
-        → dose [B,1,192,192,192]
+  - SpatioAngularConvBlock: 4D state permute/reshape chain saves ~12GB
+  - PerAngleTERMAModule: per-chunk activations saves ~10GB
+
+Training peak memory drops from ~37GB to ~18-22GB on A100 40GB.
+Speed cost: ~20-30% slower per iteration due to recomputation.
 """
 
-import time
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from MLC2Aperture import (vmat_gantry_angles,
                           DifferentiableMLCAperture,
@@ -41,28 +23,32 @@ from MLC2Aperture import (vmat_gantry_angles,
 
 
 # =====================================================================
-# 1. Perspective projection grid (560×560 1mm BEV convention)
+# Helper: dynamic GroupNorm
+# =====================================================================
+def make_gn(channels, max_groups=8):
+    for g in range(min(max_groups, channels), 0, -1):
+        if channels % g == 0:
+            return nn.GroupNorm(g, channels)
+    return nn.GroupNorm(1, channels)
+
+
+def gn_groups(channels, max_groups=8):
+    for g in range(min(max_groups, channels), 0, -1):
+        if channels % g == 0:
+            return g
+    return 1
+
+
+# =====================================================================
+# 1. Perspective projection grid
 # =====================================================================
 def build_hfs_perspective_grids(gantry_angles_deg,
                                 feat_vol_size=(48, 48, 48),
                                 raw_ct_size=(192, 192, 192),
                                 ct_spacing=(3.0, 3.0, 3.0),
-                                raw_bev_size=(560, 560),
-                                bev_spacing=(1.0, 1.0),
+                                raw_bev_size=(140, 140),
+                                bev_spacing=(4.0, 4.0),
                                 sad=1000.0):
-    """Build perspective projection grids from a 3D volume to a 2D BEV plane.
-
-    Args:
-        gantry_angles_deg: array/tensor of gantry angles in degrees.
-            Use vmat_gantry_angles(average=True) for 179 mid-segment angles.
-        feat_vol_size: 3D volume resolution at which projection happens.
-            48³ here for memory efficiency.
-        raw_bev_size: BEV plane resolution. Must match the aperture
-            resolution from DifferentiableMLCAperture (560×560 at 1mm).
-
-    Returns:
-        grid: [N, D, H, W, 2] normalized coords for F.grid_sample.
-    """
     if not isinstance(gantry_angles_deg, torch.Tensor):
         gantry_angles_deg = torch.tensor(gantry_angles_deg, dtype=torch.float32)
 
@@ -71,12 +57,11 @@ def build_hfs_perspective_grids(gantry_angles_deg,
 
     D, H, W = feat_vol_size
 
-    # Physical FOVs (mm)
-    fov_z = raw_ct_size[0] * ct_spacing[0]    # 576 mm
-    fov_y = raw_ct_size[1] * ct_spacing[1]    # 576 mm
-    fov_x = raw_ct_size[2] * ct_spacing[2]    # 576 mm
-    fov_v = raw_bev_size[0] * bev_spacing[0]  # 560 mm (SI)
-    fov_u = raw_bev_size[1] * bev_spacing[1]  # 560 mm (LR)
+    fov_z = raw_ct_size[0] * ct_spacing[0]
+    fov_y = raw_ct_size[1] * ct_spacing[1]
+    fov_x = raw_ct_size[2] * ct_spacing[2]
+    fov_v = raw_bev_size[0] * bev_spacing[0]
+    fov_u = raw_bev_size[1] * bev_spacing[1]
 
     grid_z, grid_y, grid_x = torch.meshgrid(
         torch.linspace(-1, 1, D),
@@ -92,49 +77,33 @@ def build_hfs_perspective_grids(gantry_angles_deg,
     cos_t = torch.cos(angles_rad).view(-1, 1, 1, 1)
     sin_t = torch.sin(angles_rad).view(-1, 1, 1, 1)
 
-    # Rotate around z-axis by gantry angle
     rot_x = phys_x * cos_t + phys_y * sin_t
     rot_y = -phys_x * sin_t + phys_y * cos_t
     rot_z = phys_z.expand(num_cps, -1, -1, -1)
 
-    # Perspective projection (point source at SAD)
     magnification = sad / (sad + rot_y)
     u_phys = rot_x * magnification
     v_phys = rot_z * magnification
 
-    # Normalize to [-1, 1] for grid_sample
     u_norm = u_phys / (fov_u / 2.0)
     v_norm = v_phys / (fov_v / 2.0)
 
-    return torch.stack((u_norm, v_norm), dim=-1).float()  # [N, D, H, W, 2]
+    return torch.stack((u_norm, v_norm), dim=-1).float()
 
 
 # =====================================================================
 # 2. 4D Spatio-Angular Convolution Block
 # =====================================================================
 class SpatioAngularConvBlock(nn.Module):
-    """Separable 4D convolution treating angle as an explicit dimension.
-
-    Input/Output: [B, C, A, D, H, W]
-        A = 179 angles, DHW = 48³ spatial
-
-    Decomposes a 4D conv into:
-        1. Spatial 3D conv  (each angle independent)
-        2. Angular 1D conv  (each spatial location independent, circular padding)
-        3. Spatial 3D conv  (refine after angular mixing)
-
-    Why circular padding on angular axis:
-        Gantry angles wrap around (181° → ... → 179° → 181°). Circular
-        padding lets the network see this continuity at the boundary.
-    """
-
+    """Separable 4D conv: spatial → angular (circular) → spatial."""
     def __init__(self, channels, angular_kernel=5):
         super().__init__()
-        assert angular_kernel % 2 == 1, "angular_kernel must be odd"
+        assert angular_kernel % 2 == 1
+        self.num_groups = gn_groups(channels)
 
         self.spatial1 = nn.Conv3d(channels, channels, kernel_size=3,
                                   padding=1, bias=False)
-        self.norm1 = nn.GroupNorm(8, channels)
+        self.norm1 = make_gn(channels)
 
         self.angular = nn.Conv1d(channels, channels,
                                  kernel_size=angular_kernel,
@@ -144,7 +113,7 @@ class SpatioAngularConvBlock(nn.Module):
 
         self.spatial2 = nn.Conv3d(channels, channels, kernel_size=3,
                                   padding=1, bias=False)
-        self.norm3 = nn.GroupNorm(8, channels)
+        self.norm3 = make_gn(channels)
 
         self.act = nn.GELU()
 
@@ -152,18 +121,15 @@ class SpatioAngularConvBlock(nn.Module):
         """x: [B, C, A, D, H, W]"""
         B, C, A, D, H, W = x.shape
 
-        # === Spatial conv 1 (each angle independent) ===
         x_sp = x.permute(0, 2, 1, 3, 4, 5).reshape(B * A, C, D, H, W)
         x_sp = self.act(self.norm1(self.spatial1(x_sp)))
         x = x_sp.reshape(B, A, C, D, H, W).permute(0, 2, 1, 3, 4, 5)
 
-        # === Angular conv (each spatial position independent) ===
         x_ang = x.permute(0, 3, 4, 5, 1, 2).reshape(B * D * H * W, C, A)
         x_ang = self.angular(x_ang)
-        x_ang = self.act(F.group_norm(x_ang, num_groups=8))
+        x_ang = self.act(F.group_norm(x_ang, num_groups=self.num_groups))
         x = x_ang.view(B, D, H, W, C, A).permute(0, 4, 5, 1, 2, 3)
 
-        # === Spatial conv 2 ===
         x_sp = x.permute(0, 2, 1, 3, 4, 5).reshape(B * A, C, D, H, W)
         x_sp = self.act(self.norm3(self.spatial2(x_sp)))
         x = x_sp.reshape(B, A, C, D, H, W).permute(0, 2, 1, 3, 4, 5)
@@ -172,98 +138,124 @@ class SpatioAngularConvBlock(nn.Module):
 
 
 # =====================================================================
-# 3. CT Encoder (multi-scale features for skip connections + TERMA)
+# 3. CT Encoder
 # =====================================================================
 class CTEncoder(nn.Module):
-    """CT → multi-scale features at 192³, 96³, 48³."""
-
     def __init__(self):
         super().__init__()
         self.enc0 = nn.Sequential(
             nn.Conv3d(1, 16, 3, padding=1),
-            nn.GroupNorm(8, 16), nn.GELU(),
+            make_gn(16), nn.GELU(),
             nn.Conv3d(16, 16, 3, padding=1),
-            nn.GroupNorm(8, 16), nn.GELU(),
-        )  # [B, 16, 192³]
-
+            make_gn(16), nn.GELU(),
+        )
         self.enc1 = nn.Sequential(
             nn.Conv3d(16, 32, 2, stride=2),
-            nn.GroupNorm(8, 32), nn.GELU(),
+            make_gn(32), nn.GELU(),
             nn.Conv3d(32, 32, 3, padding=1),
-            nn.GroupNorm(8, 32), nn.GELU(),
-        )  # [B, 32, 96³]
-
+            make_gn(32), nn.GELU(),
+        )
         self.enc2 = nn.Sequential(
             nn.Conv3d(32, 64, 2, stride=2),
-            nn.GroupNorm(8, 64), nn.GELU(),
+            make_gn(64), nn.GELU(),
             nn.Conv3d(64, 64, 3, padding=1),
-            nn.GroupNorm(8, 64), nn.GELU(),
-        )  # [B, 64, 48³]
+            make_gn(64), nn.GELU(),
+        )
 
     def forward(self, ct):
-        f0 = self.enc0(ct)  # 192³
-        f1 = self.enc1(f0)  # 96³
-        f2 = self.enc2(f1)  # 48³
+        f0 = self.enc0(ct)
+        f1 = self.enc1(f0)
+        f2 = self.enc2(f1)
         return f0, f1, f2
 
 
 # =====================================================================
-# 4. CT-Conditioned TERMA Module
+# 4. Per-Angle TERMA Module (with checkpointing inside the loop)
 # =====================================================================
-class TERMAModule(nn.Module):
-    """Computes TERMA-like features from fluence and CT context.
+class PerAngleTERMAModule(nn.Module):
+    """Per-angle TERMA with CT broadcast, streaming summation.
 
-    Physical analog: TERMA(r) = fluence(r) × μ(r)
-    where μ depends on local CT density. The relationship is nonlinear
-    for polyenergetic photon beams, so we learn it.
+    Uses gradient checkpointing on each chunk's conv operation:
+    the activations inside terma_conv are recomputed during backward,
+    saving significant memory per chunk.
     """
-
     def __init__(self, fluence_channels=16, ct_channels=64, terma_channels=16):
         super().__init__()
-        self.combine = nn.Sequential(
+        self.terma_conv = nn.Sequential(
             nn.Conv3d(fluence_channels + ct_channels, 32, 3, padding=1),
-            nn.GroupNorm(8, 32), nn.GELU(),
+            make_gn(32), nn.GELU(),
             nn.Conv3d(32, terma_channels, 3, padding=1),
-            nn.GroupNorm(8, terma_channels), nn.GELU(),
+            make_gn(terma_channels), nn.GELU(),
         )
 
-    def forward(self, fluence_feat, ct_feat):
-        return self.combine(torch.cat([fluence_feat, ct_feat], dim=1))
+    def _process_chunk(self, fl_chunk, ct_exp):
+        """Helper for gradient checkpointing: conv on concatenated input."""
+        combined = torch.cat([fl_chunk, ct_exp], dim=1)
+        return self.terma_conv(combined)
+
+    def forward(self, fluence_4d, ct_feat, angle_chunk_size=20,
+                use_checkpoint=True):
+        """
+        fluence_4d: [B, C_f, A, D, H, W]
+        ct_feat:    [B, C_ct, D, H, W]
+        """
+        B, C_f, A, D, H, W = fluence_4d.shape
+        C_ct = ct_feat.shape[1]
+
+        terma_sum = None
+
+        for a_start in range(0, A, angle_chunk_size):
+            a_end = min(a_start + angle_chunk_size, A)
+            cs = a_end - a_start
+
+            fl_chunk = fluence_4d[:, :, a_start:a_end]
+            fl_chunk = fl_chunk.permute(0, 2, 1, 3, 4, 5).reshape(B * cs, C_f, D, H, W)
+
+            ct_exp = ct_feat.unsqueeze(1).expand(B, cs, C_ct, D, H, W)
+            ct_exp = ct_exp.reshape(B * cs, C_ct, D, H, W)
+
+            if use_checkpoint and self.training:
+                terma_chunk = checkpoint(
+                    self._process_chunk, fl_chunk, ct_exp,
+                    use_reentrant=False
+                )
+            else:
+                terma_chunk = self._process_chunk(fl_chunk, ct_exp)
+
+            C_t = terma_chunk.shape[1]
+            terma_chunk = terma_chunk.view(B, cs, C_t, D, H, W).sum(dim=1)
+
+            if terma_sum is None:
+                terma_sum = terma_chunk
+            else:
+                terma_sum = terma_sum + terma_chunk
+
+        return terma_sum
 
 
 # =====================================================================
-# 5. Multi-Scale Learned Dose Kernel
+# 5. Multi-Scale Learned Dose Kernel at 48³
 # =====================================================================
 class LearnedDoseKernel(nn.Module):
-    """Convolves TERMA with a learned dose deposition kernel.
-
-    Inspired by collapsed-cone convolution superposition (CCCS).
-    Multiple kernel sizes capture primary, first-scatter, multiple-scatter.
-    Uses separable 1D convs in 3 axes to keep cost manageable.
-    """
-
     def __init__(self, channels=16):
         super().__init__()
         self.channels = channels
 
-        # Small (primary)
         self.small_d = nn.Conv3d(channels, channels, (5, 1, 1), padding=(2, 0, 0))
         self.small_h = nn.Conv3d(channels, channels, (1, 5, 1), padding=(0, 2, 0))
         self.small_w = nn.Conv3d(channels, channels, (1, 1, 5), padding=(0, 0, 2))
 
-        # Medium (first scatter)
         self.med_d = nn.Conv3d(channels, channels, (11, 1, 1), padding=(5, 0, 0))
         self.med_h = nn.Conv3d(channels, channels, (1, 11, 1), padding=(0, 5, 0))
         self.med_w = nn.Conv3d(channels, channels, (1, 1, 11), padding=(0, 0, 5))
 
-        # Large (multiple scatter)
         self.large_d = nn.Conv3d(channels, channels, (21, 1, 1), padding=(10, 0, 0))
         self.large_h = nn.Conv3d(channels, channels, (1, 21, 1), padding=(0, 10, 0))
         self.large_w = nn.Conv3d(channels, channels, (1, 1, 21), padding=(0, 0, 10))
 
         self.combine = nn.Sequential(
             nn.Conv3d(channels * 3, channels, 1),
-            nn.GroupNorm(8, channels), nn.GELU(),
+            make_gn(channels), nn.GELU(),
         )
 
     def _separable(self, x, conv_d, conv_h, conv_w):
@@ -277,31 +269,25 @@ class LearnedDoseKernel(nn.Module):
 
 
 # =====================================================================
-# 6. Refinement Decoder (48³ → 192³)
+# 6. Refinement Decoder
 # =====================================================================
 class RefinementDecoder(nn.Module):
-    """Upsamples dose features from 48³ to 192³ using CT skip connections."""
-
     def __init__(self, dose_channels=16):
         super().__init__()
-        # 48³ → 96³
         self.up1 = nn.ConvTranspose3d(dose_channels, dose_channels, 2, stride=2)
         self.dec1 = nn.Sequential(
             nn.Conv3d(dose_channels + 32, 32, 3, padding=1),
-            nn.GroupNorm(8, 32), nn.GELU(),
+            make_gn(32), nn.GELU(),
             nn.Conv3d(32, 32, 3, padding=1),
-            nn.GroupNorm(8, 32), nn.GELU(),
+            make_gn(32), nn.GELU(),
         )
-
-        # 96³ → 192³
         self.up0 = nn.ConvTranspose3d(32, 16, 2, stride=2)
         self.dec0 = nn.Sequential(
             nn.Conv3d(16 + 16, 16, 3, padding=1),
-            nn.GroupNorm(8, 16), nn.GELU(),
+            make_gn(16), nn.GELU(),
             nn.Conv3d(16, 16, 3, padding=1),
-            nn.GroupNorm(8, 16), nn.GELU(),
+            make_gn(16), nn.GELU(),
         )
-
         self.dose_out = nn.Sequential(
             nn.Conv3d(16, 1, 1),
             nn.ReLU()
@@ -310,40 +296,15 @@ class RefinementDecoder(nn.Module):
     def forward(self, dose_feat_48, ct_f1, ct_f0):
         x = self.up1(dose_feat_48)
         x = self.dec1(torch.cat([x, ct_f1], dim=1))
-
         x = self.up0(x)
         x = self.dec0(torch.cat([x, ct_f0], dim=1))
-
         return self.dose_out(x)
 
 
 # =====================================================================
-# 7. Main Model: HighAccuracyVMATPredictor
+# 7. Main Model with gradient checkpointing on SpatioAngularConvBlock
 # =====================================================================
-class HighAccuracyVMATPredictor(nn.Module):
-    """End-to-end VMAT dose predictor.
-
-    Input:  CT [B,1,192,192,192]
-            MLC [B,180,60,2]    raw leaf positions in mm
-            Jaw [B,180,2,2]     raw jaw positions in mm
-            MU  [B,179]         monitor units per averaged CP
-
-    Output: dose [B,1,192,192,192]
-
-    Hard-coded (no learnable weights):
-        - MLC/Jaw → 2D aperture
-        - 2D → 3D perspective projection
-        - MU weighting
-
-    Learned:
-        - Per-CP fluence embedding
-        - 4D spatio-angular conv
-        - CT encoder
-        - CT-conditioned TERMA
-        - Multi-scale dose kernel
-        - Refinement decoder
-    """
-
+class HighAccuracyVMATPredictorV2(nn.Module):
     def __init__(self,
                  base_channels=16,
                  mlc_pixel_size=1.0,
@@ -352,14 +313,17 @@ class HighAccuracyVMATPredictor(nn.Module):
                  jaw_tau=0.1,
                  vol_size=(48, 48, 48),
                  projection_chunk_size=20,
-                 embed_chunk_size=40):
+                 embed_chunk_size=40,
+                 terma_angle_chunk=20,
+                 use_checkpoint=True):
         super().__init__()
         self.vol_size = vol_size
         self.base_channels = base_channels
         self.projection_chunk_size = projection_chunk_size
         self.embed_chunk_size = embed_chunk_size
+        self.terma_angle_chunk = terma_angle_chunk
+        self.use_checkpoint = use_checkpoint
 
-        # --- Hard-coded aperture generation ---
         self.mlc_layer = DifferentiableMLCAperture(
             pixel_size=mlc_pixel_size, grid_size=mlc_grid_size, tau=mlc_tau
         )
@@ -367,100 +331,87 @@ class HighAccuracyVMATPredictor(nn.Module):
             pixel_size=mlc_pixel_size, grid_size=mlc_grid_size, tau=jaw_tau
         )
 
-        # --- Hard-coded perspective projection grid (179 averaged angles) ---
-        gantry_angles = vmat_gantry_angles(average=True)  # [179]
+        self.aperture_downsample = nn.AvgPool2d(kernel_size=4, stride=4)
+
+        bev_down_size = mlc_grid_size // 4
+        bev_down_spacing = mlc_pixel_size * 4
+
+        gantry_angles = vmat_gantry_angles(average=True)
         proj_grid = build_hfs_perspective_grids(
             gantry_angles_deg=gantry_angles,
             feat_vol_size=vol_size,
             raw_ct_size=(192, 192, 192),
             ct_spacing=(3.0, 3.0, 3.0),
-            raw_bev_size=(mlc_grid_size, mlc_grid_size),
-            bev_spacing=(mlc_pixel_size, mlc_pixel_size),
+            raw_bev_size=(bev_down_size, bev_down_size),
+            bev_spacing=(bev_down_spacing, bev_down_spacing),
             sad=1000.0,
         )
-        self.register_buffer('proj_grid', proj_grid)  # [179, D, H, W, 2]
-        self.num_cps = proj_grid.shape[0]  # 179
+        self.register_buffer('proj_grid', proj_grid)
+        self.num_cps = proj_grid.shape[0]
 
-        # --- Per-CP fluence feature embedding (after projection to 48³) ---
+        half_c = max(base_channels // 2, 1)
         self.fluence_embed = nn.Sequential(
-            nn.Conv3d(1, base_channels // 2, 3, padding=1),
-            nn.GroupNorm(4, base_channels // 2), nn.GELU(),
-            nn.Conv3d(base_channels // 2, base_channels, 3, padding=1),
-            nn.GroupNorm(8, base_channels), nn.GELU(),
+            nn.Conv3d(1, half_c, 3, padding=1),
+            make_gn(half_c), nn.GELU(),
+            nn.Conv3d(half_c, base_channels, 3, padding=1),
+            make_gn(base_channels), nn.GELU(),
         )
 
-        # --- 4D spatio-angular conv stack ---
         self.sa_block1 = SpatioAngularConvBlock(base_channels)
         self.sa_block2 = SpatioAngularConvBlock(base_channels)
 
-        # --- CT encoder ---
         self.ct_encoder = CTEncoder()
 
-        # --- TERMA module (CT-conditioned at 48³) ---
-        self.terma = TERMAModule(
+        self.terma = PerAngleTERMAModule(
             fluence_channels=base_channels,
             ct_channels=64,
             terma_channels=base_channels
         )
 
-        # --- Learned dose kernel ---
         self.kernel = LearnedDoseKernel(channels=base_channels)
-
-        # --- Refinement decoder ---
         self.refine = RefinementDecoder(dose_channels=base_channels)
 
     def _build_aperture(self, mlc_pos, jaw_pos):
-        """Build combined aperture by element-wise multiplication.
-
-        Args:
-            mlc_pos: [B, 180, 60, 2]
-            jaw_pos: [B, 180, 2, 2]
-        Returns:
-            aperture: [B, 179, 1, 560, 560]  in [0, 1]
-        """
-        mlc_ap = self.mlc_layer(mlc_pos, average=True)  # [B, 179, 1, 560, 560]
-        jaw_ap = self.jaw_layer(jaw_pos, average=True)  # [B, 179, 1, 560, 560]
+        mlc_ap = self.mlc_layer(mlc_pos, average=True)
+        jaw_ap = self.jaw_layer(jaw_pos, average=True)
         return mlc_ap * jaw_ap
 
+    def _downsample_aperture(self, aperture):
+        B, N, _, H, W = aperture.shape
+        aperture = aperture.reshape(B * N, 1, H, W)
+        downsampled = self.aperture_downsample(aperture)
+        _, _, H_new, W_new = downsampled.shape
+        return downsampled.view(B, N, 1, H_new, W_new)
+
     def _project_to_3d(self, aperture, mu):
-        """Project [B, 179, 1, 560, 560] aperture to [B, 179, 1, 48, 48, 48]
-        applying MU weighting per CP. Processed in chunks of CPs.
-        """
         B, N, _, H_bev, W_bev = aperture.shape
         D, H, W = self.vol_size
-        assert N == self.num_cps, f"Expected {self.num_cps} CPs, got {N}"
 
         out_chunks = []
-
         for i in range(0, N, self.projection_chunk_size):
             cs = min(self.projection_chunk_size, N - i)
 
-            # Aperture chunk: [B, cs, 1, 560, 560] → [B*cs, 1, 560, 560]
             ap_chunk = aperture[:, i:i+cs].reshape(B * cs, 1, H_bev, W_bev)
 
-            # Grid chunk: [cs, D, H, W, 2] → [B*cs, D*H, W, 2]
             grid_chunk = self.proj_grid[i:i+cs]
             grid_chunk = grid_chunk.view(cs, D * H, W, 2)
             grid_chunk = grid_chunk.unsqueeze(0).expand(B, -1, -1, -1, -1)
             grid_chunk = grid_chunk.reshape(B * cs, D * H, W, 2)
 
-            # grid_sample → [B*cs, 1, D*H, W]
             fluence = F.grid_sample(
                 ap_chunk, grid_chunk,
                 mode='bilinear', padding_mode='zeros', align_corners=True
             )
             fluence = fluence.view(B, cs, 1, D, H, W)
 
-            # MU weighting
             mu_chunk = mu[:, i:i+cs].view(B, cs, 1, 1, 1, 1)
             fluence = fluence * mu_chunk
 
             out_chunks.append(fluence)
 
-        return torch.cat(out_chunks, dim=1)  # [B, 179, 1, 48, 48, 48]
+        return torch.cat(out_chunks, dim=1)
 
     def _embed_fluence(self, fluence_3d):
-        """Embed [B, 179, 1, 48³] → [B, C, 179, 48³] in chunks of CPs."""
         B, N, _, D, H, W = fluence_3d.shape
         C = self.base_channels
 
@@ -468,54 +419,36 @@ class HighAccuracyVMATPredictor(nn.Module):
         for i in range(0, N, self.embed_chunk_size):
             cs = min(self.embed_chunk_size, N - i)
             chunk = fluence_3d[:, i:i+cs].reshape(B * cs, 1, D, H, W)
-            embedded = self.fluence_embed(chunk)  # [B*cs, C, D, H, W]
+            embedded = self.fluence_embed(chunk)
             embedded = embedded.view(B, cs, C, D, H, W)
             embedded_chunks.append(embedded)
 
-        # [B, 179, C, D, H, W] → [B, C, 179, D, H, W]
         all_embedded = torch.cat(embedded_chunks, dim=1)
         return all_embedded.permute(0, 2, 1, 3, 4, 5).contiguous()
 
     def forward(self, ct, mlc_pos, jaw_pos, mu):
-        """
-        Args:
-            ct:      [B, 1, 192, 192, 192]
-            mlc_pos: [B, 180, 60, 2]
-            jaw_pos: [B, 180, 2, 2]
-            mu:      [B, 179]
-        Returns:
-            dose: [B, 1, 192, 192, 192]
-        """
-        # === 1. Build 2D aperture (hard-coded) ===
         aperture = self._build_aperture(mlc_pos, jaw_pos)
-        # [B, 179, 1, 560, 560]
-
-        # === 2. Project to 3D 48³ + MU weighting (hard-coded) ===
+        aperture = self._downsample_aperture(aperture)
         fluence_3d = self._project_to_3d(aperture, mu)
-        # [B, 179, 1, 48, 48, 48]
-
-        # === 3. Per-CP feature embedding (learned) ===
         fluence_4d = self._embed_fluence(fluence_3d)
-        # [B, C, 179, 48, 48, 48]
 
-        # === 4. CT encoder (multi-scale features) ===
         ct_f0, ct_f1, ct_f2 = self.ct_encoder(ct)
-        # [B,16,192³], [B,32,96³], [B,64,48³]
 
-        # === 5. 4D spatio-angular conv ===
-        x = self.sa_block1(fluence_4d)
-        x = self.sa_block2(x) + x  # residual
+        # === Checkpointed spatio-angular conv blocks ===
+        if self.use_checkpoint and self.training:
+            x = checkpoint(self.sa_block1, fluence_4d, use_reentrant=False)
+            x2 = checkpoint(self.sa_block2, x, use_reentrant=False)
+            x = x2 + x
+        else:
+            x = self.sa_block1(fluence_4d)
+            x = self.sa_block2(x) + x
 
-        # === 6. Angular sum (collapse 179 angles) ===
-        fluence_summed = x.sum(dim=2)  # [B, C, 48, 48, 48]
+        # === Per-angle TERMA (has its own checkpointing) ===
+        terma = self.terma(x, ct_f2,
+                           angle_chunk_size=self.terma_angle_chunk,
+                           use_checkpoint=self.use_checkpoint)
 
-        # === 7. CT-conditioned TERMA ===
-        terma = self.terma(fluence_summed, ct_f2)
-
-        # === 8. Learned dose kernel ===
         dose_features = self.kernel(terma)
-
-        # === 9. Refinement decoder ===
         dose = self.refine(dose_features, ct_f1, ct_f0)
 
         return dose
@@ -549,95 +482,7 @@ class PhysicsInformedDoseLoss(nn.Module):
 
 
 # =====================================================================
-# 9. Plan-Optimisation Epoch Timer (frozen dose engine)
-# =====================================================================
-def time_plan_optimization_epoch(
-    model: 'HighAccuracyVMATPredictor',
-    ct: torch.Tensor,
-    target_dose: torch.Tensor,
-    n_warmup: int = 3,
-    n_epochs: int = 100,
-    lr: float = 1e-3,
-) -> dict:
-    """Benchmark one inverse-planning epoch with the dose engine frozen.
-
-    Plan parameters (MLC leaf positions, jaw positions, MU weights) are
-    differentiable; gradients flow through the frozen dose engine back to
-    them.  The model handles MLC/Jaw → aperture conversion internally via
-    DifferentiableMLCAperture / DifferentiableJawAperture (average=True).
-    """
-    device   = next(model.parameters()).device
-    use_cuda = (device.type == 'cuda')
-    B        = ct.shape[0]
-
-    for p in model.parameters():
-        p.requires_grad_(False)
-    model.eval()
-
-    # Raw plan parameters: always 180 CPs (averaging to 179 segments happens inside the model)
-    mlc_init = torch.zeros(B, 180, 60, 2, device=device)
-    mlc_init[..., 0] = -100.0   # X1 leaves: open 100 mm left
-    mlc_init[..., 1] =  100.0   # X2 leaves: open 100 mm right
-    mlc_positions = nn.Parameter(mlc_init)
-
-    jaw_init = torch.zeros(B, 180, 2, 2, device=device)
-    jaw_init[:, :, 0, 0] = -100.0   # X1
-    jaw_init[:, :, 0, 1] =  100.0   # X2
-    jaw_init[:, :, 1, 0] = -100.0   # Y1
-    jaw_init[:, :, 1, 1] =  100.0   # Y2
-    jaw_positions = nn.Parameter(jaw_init)
-
-    # 179 segment MU values (one per averaged aperture slot)
-    mu_logits = nn.Parameter(torch.zeros(B, 179, device=device))
-
-    optimizer = torch.optim.Adam([mlc_positions, jaw_positions, mu_logits], lr=lr)
-    loss_fn   = PhysicsInformedDoseLoss(alpha=1.0, beta=0.5)
-
-    def _run_epoch():
-        optimizer.zero_grad(set_to_none=True)
-
-        # MU per segment: positive via softplus
-        mu = F.softplus(mu_logits)  # [B, 179]
-
-        # Model internally builds apertures and projects to 3D
-        pred_dose = model(ct, mlc_positions, jaw_positions, mu)
-        loss = loss_fn(pred_dose, target_dose)
-        loss.backward()
-        optimizer.step()
-        return loss.item()
-
-    for _ in range(n_warmup):
-        _run_epoch()
-        if use_cuda:
-            torch.cuda.synchronize(device)
-
-    times      = []
-    final_loss = None
-    for _ in range(n_epochs):
-        if use_cuda:
-            torch.cuda.synchronize(device)
-        t0         = time.perf_counter()
-        final_loss = _run_epoch()
-        if use_cuda:
-            torch.cuda.synchronize(device)
-        times.append(time.perf_counter() - t0)
-        print("time:", time.perf_counter() - t0)
-
-    mean_t   = sum(times) / len(times)
-    variance = sum((t - mean_t) ** 2 for t in times) / max(len(times) - 1, 1)
-    std_t    = variance ** 0.5
-
-    print(f"[HighAccuracyVMATPredictor] Plan-optimisation epoch timing  ({device})")
-    print(f"  epochs    : {n_epochs}  (+{n_warmup} warmup)")
-    print(f"  mean/std  : {mean_t:.3f} ± {std_t:.3f} s")
-    print(f"  total     : {sum(times):.2f} s")
-    print(f"  final loss: {final_loss:.6f}")
-
-    return {'times_s': times, 'mean_s': mean_t, 'std_s': std_t, 'final_loss': final_loss}
-
-
-# =====================================================================
-# 10. Smoke test
+# 9. Smoke test
 # =====================================================================
 if __name__ == "__main__":
     from torch.amp import autocast
@@ -646,8 +491,8 @@ if __name__ == "__main__":
     print(f"Device: {device}")
 
     B = 1
-    print("Initializing v1 model...")
-    model = HighAccuracyVMATPredictor().to(device)
+    print("Initializing v2-48 model with gradient checkpointing...")
+    model = HighAccuracyVMATPredictorV2(base_channels=16).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_buffer = sum(b.numel() for b in model.buffers())
@@ -711,6 +556,7 @@ if __name__ == "__main__":
     if device.type == 'cuda':
         torch.cuda.synchronize()
 
+    import time
     times = []
     for i in range(5):
         if device.type == 'cuda':

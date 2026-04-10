@@ -1,14 +1,12 @@
 import os
 import glob
+import argparse
 import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 from pathlib import Path
-
-from HighAccuracyVMATPredictor import (HighAccuracyVMATPredictor,
-                                        PhysicsInformedDoseLoss)
 
 
 # =====================================================================
@@ -81,6 +79,22 @@ class VMATDataset(Dataset):
 # 2. Main Training & Validation Loop
 # =====================================================================
 def main():
+    parser = argparse.ArgumentParser(description='VMAT Dose Predictor Training')
+    parser.add_argument('--model', type=str, default='v1', choices=['v1', 'v2'],
+                        help='Model version: v1=HighAccuracyVMATPredictor, v2=HighAccuracyVMATPredictorV2')
+    args = parser.parse_args()
+
+    if args.model == 'v2':
+        from HighAccuracyVMATPredictor_v2 import (HighAccuracyVMATPredictorV2 as ModelClass,
+                                                   PhysicsInformedDoseLoss)
+        ckpt_name = 'best_vmat_highacc_v2_model.pth'
+    else:
+        from HighAccuracyVMATPredictor import (HighAccuracyVMATPredictor as ModelClass,
+                                               PhysicsInformedDoseLoss)
+        ckpt_name = ckpt_name
+
+    print(f"Using model: {args.model} ({ModelClass.__name__})")
+
     current_dir   = Path(__file__).resolve().parent
     data_dir      = os.path.join(current_dir, '../preprocessing-dev/npy_total/')
     batch_size    = 1
@@ -112,7 +126,7 @@ def main():
                               num_workers=4, pin_memory=True)
 
     # Model now handles MLC/Jaw → aperture → projection internally
-    model     = HighAccuracyVMATPredictor().to(device)
+    model     = ModelClass().to(device)
     criterion = PhysicsInformedDoseLoss(alpha=1.0, beta=0.5).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
@@ -177,12 +191,12 @@ def main():
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(),
-                       os.path.join(save_dir, 'best_vmat_highacc_model.pth'))
+                       os.path.join(save_dir, ckpt_name))
             print(f" -> Best model saved at epoch {epoch+1}")
 
     # --- Test ---
     print("\nTraining Complete. Running Test Phase...")
-    model.load_state_dict(torch.load(os.path.join(save_dir, 'best_vmat_highacc_model.pth')))
+    model.load_state_dict(torch.load(os.path.join(save_dir, ckpt_name)))
     model.eval()
     test_loss = 0.0
     with torch.no_grad():
